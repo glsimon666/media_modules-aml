@@ -68,8 +68,34 @@
 #define INTERLACE_FLAG          0x80
 #define BOTTOM_FIELD_FIRST_FLAG 0x40
 
+/* VC-1 sequence header parsing */
+#define VC1_START_CODE_SEQ_HEADER 0x0F  /* Start code: 0x00 00 01 0F */
+
+/* VC-1 scan types */
+#define SCAN_TYPE_INTERLACED   0
+#define SCAN_TYPE_PROGRESSIVE  1
+
+/* Software parsing buffer */
+#define VC1_SW_BUFFER_SIZE     (32 * 1024)  /* 32KB */
+
+/* VC-1 sequence metadata */
+struct vc1_seq_meta {
+    u32 finterlace;      /* 0=progressive, 1=interlaced */
+    u32 psf;             /* Progressive Segmented Frame */
+    u32 scan_type;       /* SCAN_TYPE_INTERLACED or SCAN_TYPE_PROGRESSIVE */
+    u32 profile;         /* 0=Simple, 1=Main, 2=Advanced, 3=Advanced */
+    u32 valid;           /* 1=parsing successful */
+};
+
+/* Global variables for software parsing */
+static struct vc1_seq_meta vc1_sw_meta = {0};
+static u8 *vc1_sw_buffer = NULL;
+static u32 vc1_sw_buffer_offset = 0;
+static u32 vc1_sw_parse_valid = 0;
+
 /* protocol registers */
 #define VC1_PIC_RATIO       AV_SCRATCH_0
+#define VC1_PIC_INFO        AV_SCRATCH_J
 #define VC1_ERROR_COUNT    AV_SCRATCH_6
 #define VC1_SOS_COUNT     AV_SCRATCH_7
 #define VC1_BUFFERIN       AV_SCRATCH_8
@@ -138,6 +164,7 @@ static u32 avi_flag;
 static u32 unstable_pts_debug;
 static u32 unstable_pts;
 static u32 vvc1_ratio;
+static u32 vc1_scan_debug = 0;
 static u32 vvc1_format;
 
 static int ar = 0;
@@ -293,6 +320,144 @@ static void set_aspect_ratio(struct vframe_s *vf, unsigned int pixel_ratio)
 	/*vf->ratio_control |= DISP_RATIO_FORCECONFIG | DISP_RATIO_KEEPRATIO;*/
 }
 
+/* Bit reader for VC-1 bitstream parsing */
+struct bit_reader {
+    const u8 *data;
+    u32 size;
+    u32 offset;      /* Byte offset */
+    u32 bit_pos;     /* Bit position (0-7) */
+};
+
+/* Initialize bit reader */
+static void bit_reader_init(struct bit_reader *br, const u8 *data, u32 size)
+{
+    br->data = data;
+    br->size = size;
+    br->offset = 0;
+    br->bit_pos = 0;
+}
+
+/* Read N bits */
+static u32 bit_reader_read_bits(struct bit_reader *br, u32 num_bits)
+{
+    u32 value = 0;
+    u32 i;
+    
+    if (!br || br->data == NULL || br->size == 0) {
+        return 0;
+    }
+    
+    for (i = 0; i < num_bits; i++) {
+        if (br->offset >= br->size) {
+            break;
+        }
+        
+        u8 current_byte = br->data[br->offset];
+        u8 bit = (current_byte >> (7 - br->bit_pos)) & 0x01;
+        value = (value << 1) | bit;
+        
+        br->bit_pos++;
+        if (br->bit_pos >= 8) {
+            br->bit_pos = 0;
+            br->offset++;
+        }
+    }
+    
+    return value;
+}
+
+/* Find VC-1 start code */
+static const u8 *find_vc1_start_code(const u8 *data, u32 size, u8 start_code)
+{
+    u32 i;
+    
+    if (!data || size < 4) {
+        return NULL;
+    }
+    
+    for (i = 0; i <= size - 4; i++) {
+        if (data[i] == 0x00 && data[i+1] == 0x00 && 
+            data[i+2] == 0x01 && data[i+3] == start_code) {
+            return &data[i];
+        }
+    }
+    
+    return NULL;
+}
+
+/* Parse VC-1 Annex B sequence header - based on Go parseVC1AnnexBMeta */
+static int parse_vc1_annexb_sequence_header(const u8 *data, u32 size, 
+                                             struct vc1_seq_meta *meta)
+{
+    const u8 *seq_start;
+    struct bit_reader br = {0};
+    u32 value;
+    
+    /* Find sequence header start code */
+    seq_start = find_vc1_start_code(data, size, VC1_START_CODE_SEQ_HEADER);
+    if (!seq_start) {
+        return -EINVAL;
+    }
+    
+    u32 header_offset = seq_start - data;
+    if (header_offset + 4 >= size) {
+        return -EINVAL;
+    }
+    
+    /* Initialize bit reader (skip 4-byte start code) */
+    bit_reader_init(&br, seq_start + 4, size - header_offset - 4);
+    
+    /* Profile (2 bits) */
+    value = bit_reader_read_bits(&br, 2);
+    if (value > 3) {  /* Invalid profile */
+        return -ENOTSUPP;
+    }
+    
+    /* Support all VC-1 profiles: 0=Simple, 1=Main, 2=Advanced, 3=Advanced */
+    meta->profile = value;
+    
+    /* Skip various fields */
+    bit_reader_read_bits(&br, 3);  /* level */
+    bit_reader_read_bits(&br, 2);  /* colordiff_format */
+    bit_reader_read_bits(&br, 3);  /* frmrtq_postproc */
+    bit_reader_read_bits(&br, 5);  /* bitrtq_postproc */
+    bit_reader_read_bits(&br, 1);  /* postprocflag */
+    bit_reader_read_bits(&br, 12); /* coded_width */
+    bit_reader_read_bits(&br, 12); /* coded_height */
+    bit_reader_read_bits(&br, 1);  /* pulldown */
+    
+    /* INTERLACE flag (1 bit) - Critical for scan type */
+    meta->finterlace = bit_reader_read_bits(&br, 1);
+    
+    /* Skip other flags */
+    bit_reader_read_bits(&br, 1);  /* tfcntrflag */
+    bit_reader_read_bits(&br, 1);  /* finterpflag */
+    bit_reader_read_bits(&br, 1);  /* reserved */
+    
+    /* PSF flag (1 bit) - Progressive Segmented Frame */
+    meta->psf = bit_reader_read_bits(&br, 1);
+    
+    /* Determine scan type (following Go logic) */
+    if (meta->finterlace == 1) {
+        meta->scan_type = SCAN_TYPE_INTERLACED;
+    } else if (meta->psf == 1) {
+        meta->scan_type = SCAN_TYPE_PROGRESSIVE;  /* PSF progressive */
+    } else {
+        meta->scan_type = SCAN_TYPE_PROGRESSIVE;  /* Normal progressive */
+    }
+    
+    meta->valid = 1;
+    
+    if (vc1_scan_debug) {
+        pr_info("VC-1 SW parse: profile=%d, finterlace=%d, psf=%d, scan=%s\n",
+               meta->profile, meta->finterlace, meta->psf,
+               meta->scan_type == SCAN_TYPE_INTERLACED ? 
+               "Interlaced" : "Progressive");
+    }
+    
+    return 0;
+}
+
 static int ge2d_canvas_dup(struct canvas_s *srcy, struct canvas_s *srcu,
 		struct canvas_s *des, int format, u32 srcindex, u32 desindex)
 {
@@ -388,6 +553,51 @@ static void vc1_set_rp(void) {
 	STBUF_WRITE(&vdec->vbuf, set_rp,
 		READ_VREG(VLD_MEM_VIFIFO_RP));
 	spin_unlock_irqrestore(&vc1_rp_lock, flags);
+}
+
+/* Initialize software parser */
+static void vc1_sw_parser_init(void)
+{
+    if (!vc1_sw_buffer) {
+        vc1_sw_buffer = kzalloc(VC1_SW_BUFFER_SIZE, GFP_KERNEL);
+        if (!vc1_sw_buffer) {
+            pr_err("VC-1: Failed to allocate software parse buffer\n");
+            return;
+        }
+    }
+    
+    vc1_sw_buffer_offset = 0;
+    vc1_sw_parse_valid = 0;
+    memset(&vc1_sw_meta, 0, sizeof(vc1_sw_meta));
+}
+
+/* Collect stream data for parsing */
+static void vc1_collect_stream_data(const u8 *data, u32 size)
+{
+    if (!vc1_sw_buffer || vc1_sw_parse_valid) {
+        return;
+    }
+    
+    /* Reset buffer if full */
+    if (vc1_sw_buffer_offset + size > VC1_SW_BUFFER_SIZE) {
+        vc1_sw_buffer_offset = 0;
+    }
+    
+    u32 copy_size = min(size, VC1_SW_BUFFER_SIZE - vc1_sw_buffer_offset);
+    if (copy_size > 0) {
+        memcpy(vc1_sw_buffer + vc1_sw_buffer_offset, data, copy_size);
+        vc1_sw_buffer_offset += copy_size;
+        
+        /* Try to parse when we have enough data */
+        if (vc1_sw_buffer_offset >= 256 && !vc1_sw_parse_valid) {
+            int result = parse_vc1_annexb_sequence_header(vc1_sw_buffer,
+                                                         vc1_sw_buffer_offset,
+                                                         &vc1_sw_meta);
+            if (result == 0) {
+                vc1_sw_parse_valid = 1;
+            }
+        }
+    }
 }
 
 static irqreturn_t vvc1_isr(int irq, void *dev_id)
@@ -543,8 +753,26 @@ static irqreturn_t vvc1_isr(int irq, void *dev_id)
 			frm.num += (repeat_count > 1) ? repeat_count : 1;
 		if (vvc1_amstream_dec_info.rate == 0)
 			vvc1_amstream_dec_info.rate = PTS2DUR(frm.rate);
+		
+		/* --- 扫描类型决策：软件有效就用软件，无效用硬件 --- */
+		u32 final_interlace = 0;
+		u32 use_software = 0;
+		
+		if (vc1_sw_parse_valid) {
+			final_interlace = vc1_sw_meta.finterlace;
+			use_software = 1;
+			/* 记录硬件/软件差异 */
+			if ((reg & INTERLACE_FLAG) && !vc1_sw_meta.finterlace) {
+				pr_warn("VC-1: HW says interlace, SW says progressive (corrected)\n");
+			} else if (!(reg & INTERLACE_FLAG) && vc1_sw_meta.finterlace) {
+				pr_warn("VC-1: HW says progressive, SW says interlace (corrected)\n");
+			}
+		} else {
+			final_interlace = (reg & INTERLACE_FLAG) ? 1 : 0;
+		}
+		/* ------------------------------------------------- */
 
-		if ((reg & INTERLACE_FLAG) && ! force_frameint) {	/* field interlace */
+		if (final_interlace && !force_frameint) {	/* field interlace */
 			if (kfifo_get(&newframe_q, &vf) == 0) {
 				pr_info
 				("fatal error, no available buffer slot.");
@@ -613,8 +841,14 @@ static irqreturn_t vvc1_isr(int irq, void *dev_id)
 			}
 
 			vf->duration_pulldown = 0;
-			vf->type = (reg & BOTTOM_FIELD_FIRST_FLAG) ?
-			VIDTYPE_INTERLACE_BOTTOM : VIDTYPE_INTERLACE_TOP;
+			if (final_interlace) {
+				// 隔行扫描
+				vf->type = (reg & BOTTOM_FIELD_FIRST_FLAG) ?
+				VIDTYPE_INTERLACE_BOTTOM : VIDTYPE_INTERLACE_TOP;
+			} else {
+				// 逐行扫描
+				vf->type = VIDTYPE_PROGRESSIVE;
+			}
 #ifdef NV21
 			vf->type |= VIDTYPE_VIU_NV21;
 #endif
@@ -677,8 +911,14 @@ static irqreturn_t vvc1_isr(int irq, void *dev_id)
 			}
 
 			vf->duration_pulldown = 0;
-			vf->type = !(reg & BOTTOM_FIELD_FIRST_FLAG) ?
-			VIDTYPE_INTERLACE_BOTTOM : VIDTYPE_INTERLACE_TOP;
+			if (final_interlace) {
+				// 隔行扫描
+				vf->type = !(reg & BOTTOM_FIELD_FIRST_FLAG) ?
+				VIDTYPE_INTERLACE_BOTTOM : VIDTYPE_INTERLACE_TOP;
+			} else {
+				// 逐行扫描
+				vf->type = VIDTYPE_PROGRESSIVE;
+			}
 #ifdef NV21
 			vf->type |= VIDTYPE_VIU_NV21;
 #endif
@@ -700,7 +940,12 @@ static irqreturn_t vvc1_isr(int irq, void *dev_id)
 					PROVIDER_NAME,
 					VFRAME_EVENT_PROVIDER_VFRAME_READY,
 					NULL);
-		} else {	/* progressive or frame interlace */
+
+		} else {	/* progressive or frame interlace (based on software parse) */
+			if (use_software) {
+				/* 如果使用软件解析，记录此决策 */
+				pr_info("VC-1: Using software scan type=%d\n", final_interlace);
+			}
 			if (kfifo_get(&newframe_q, &vf) == 0) {
 				pr_info
 				("fatal error, no available buffer slot.");
@@ -770,13 +1015,20 @@ static irqreturn_t vvc1_isr(int irq, void *dev_id)
 			}
 
 			vf->duration_pulldown = 0;
+			if (final_interlace) {
+				// 隔行扫描
+				vf->type = (reg & BOTTOM_FIELD_FIRST_FLAG) ?
+				VIDTYPE_INTERLACE_BOTTOM : VIDTYPE_INTERLACE_TOP;
+			} else {
+				// 逐行扫描
 #ifdef NV21
-			vf->type =
-				VIDTYPE_PROGRESSIVE | VIDTYPE_VIU_FIELD |
-				VIDTYPE_VIU_NV21;
+				vf->type =
+					VIDTYPE_PROGRESSIVE | VIDTYPE_VIU_FIELD |
+					VIDTYPE_VIU_NV21;
 #else
-			vf->type = VIDTYPE_PROGRESSIVE | VIDTYPE_VIU_FIELD;
+				vf->type = VIDTYPE_PROGRESSIVE | VIDTYPE_VIU_FIELD;
 #endif
+			}
 			vf->canvas0Addr = vf->canvas1Addr =
 						index2canvas(buffer_index);
 			vf->orientation = 0;
